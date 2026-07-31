@@ -1,0 +1,354 @@
+import { Injectable } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository, SelectQueryBuilder, Brackets, In } from 'typeorm';
+import { Post } from '@/modules/post/entity/post.entity';
+import { PostBlock } from '@/modules/post/entity/post-block.entity';
+import { PostContributor } from '@/modules/post/entity/post-contributor.entity';
+import { PostBlockType } from '@/enums/post-block-type.enum';
+import { BlockValueMap } from '@/modules/post/types/post-block.types';
+import {
+  SearchPostsDto,
+  PaginatedSearchResponseDto,
+  SearchResultItemDto,
+} from './dto/search.dto';
+import { DateTime } from 'luxon';
+
+type DecodedSearchCursor = {
+  eventAt: Date;
+  id: string;
+  count?: number;
+};
+
+@Injectable()
+export class SearchService {
+  // userId -> string[] (LIFO, max 10)
+  // TODO: Migrate to Redis for production (persistent storage across server restarts)
+  private recentSearches = new Map<string, string[]>();
+
+  // userId -> (tag -> count)
+  // TODO: Migrate to Redis (ZSET or HASH with INCRBY)
+  private tagFrequencies = new Map<string, Map<string, number>>();
+
+  constructor(
+    @InjectRepository(Post)
+    private readonly postRepository: Repository<Post>,
+  ) {}
+
+  async searchPosts(
+    userId: string,
+    dto: SearchPostsDto,
+    cursor?: string,
+    limit: number = 20,
+  ): Promise<PaginatedSearchResponseDto> {
+    if (dto.keyword) {
+      this.saveRecentSearch(userId, dto.keyword);
+    }
+    if (dto.tags && dto.tags.length > 0) {
+      this.trackTags(userId, dto.tags);
+    }
+
+    const isDateOnly = (value: string) => /^\d{4}-\d{2}-\d{2}$/.test(value);
+    let startDate = dto.startDate;
+    let endDate = dto.endDate;
+
+    if (startDate && !endDate) {
+      // 단일 날짜 선택: 해당 날짜의 시작~끝으로 범위 확장
+      if (isDateOnly(startDate)) {
+        const startOfDay = DateTime.fromISO(startDate, {
+          zone: 'Asia/Seoul',
+        }).startOf('day');
+        const endOfDay = startOfDay.endOf('day');
+        startDate = startOfDay.toISO() ?? undefined;
+        endDate = endOfDay.toISO() ?? undefined;
+      } else {
+        const startDt = DateTime.fromISO(startDate, { setZone: true });
+        if (startDt.isValid) {
+          endDate = startDt.endOf('day').toISO() ?? undefined;
+        }
+      }
+    } else if (startDate && endDate) {
+      // 기간 선택: date-only 문자열이면 한국 시간 기준으로 시작/끝 시각으로 변환
+      startDate = this.normalizeDateOnlyBoundary(startDate, 'start');
+      endDate = this.normalizeDateOnlyBoundary(endDate, 'end');
+    }
+    const query = this.postRepository
+      .createQueryBuilder('post')
+      .leftJoin('post.ownerUser', 'ownerUser')
+      .where(
+        new Brackets((qb) => {
+          qb.where('post.ownerUserId = :userId', { userId }).orWhere(
+            (subQb: SelectQueryBuilder<Post>) => {
+              const sub = subQb
+                .subQuery()
+                .select('1')
+                .from(PostContributor, 'pc')
+                .where('pc.postId = post.id')
+                .andWhere('pc.userId = :userId')
+                .getQuery();
+              return `EXISTS ${sub}`;
+            },
+            { userId },
+          );
+        }),
+      )
+      .andWhere('post.deletedAt IS NULL');
+
+    // Keyword Search (Title or Content Blocks)
+    if (dto.keyword) {
+      query.andWhere(
+        new Brackets((qb) => {
+          qb.where('post.title ILIKE :keyword', {
+            keyword: `%${dto.keyword}%`,
+          }).orWhere(
+            "EXISTS (SELECT 1 FROM post_blocks pb WHERE pb.post_id = post.id AND pb.type = :textType AND pb.value->>'text' ILIKE :keyword)",
+            { textType: PostBlockType.TEXT, keyword: `%${dto.keyword}%` },
+          );
+        }),
+      );
+    }
+
+    // Date Range Search
+    if (startDate) {
+      query.andWhere('post.eventAt >= :startDate', {
+        startDate,
+      });
+    }
+    if (endDate) {
+      query.andWhere('post.eventAt <= :endDate', { endDate });
+    }
+
+    // Tag Search
+    if (dto.tags && dto.tags.length > 0) {
+      query.andWhere('post.tags && :tags', { tags: dto.tags });
+    }
+
+    // Emotion Search
+    if (dto.emotions && dto.emotions.length > 0) {
+      query.andWhere('post.emotion && :emotions', { emotions: dto.emotions });
+    }
+
+    // Location Search (Nearby)
+    if (dto.latitude !== undefined && dto.longitude !== undefined) {
+      query.andWhere(
+        'ST_DWithin(post.location, ST_SetSRID(ST_Point(:lng, :lat), 4326), :radius)',
+        {
+          lng: dto.longitude,
+          lat: dto.latitude,
+          radius: (dto.radius || 5) * 1000, // km to meters
+        },
+      );
+    }
+
+    const decodedCursor = this.decodeCursor(cursor);
+    const count =
+      decodedCursor?.count ?? (await query.clone().distinct(true).getCount());
+
+    // Cursor Pagination Logic
+    this.applyCursor(query, decodedCursor);
+
+    // Sorting: Most recent first
+    query.orderBy('post.eventAt', 'DESC').addOrderBy('post.id', 'DESC');
+
+    // Limit + 1 to check for next page
+    query.take(limit + 1);
+
+    const posts = await query.getMany();
+
+    const hasNextPage = posts.length > limit;
+    const items = posts.slice(0, limit);
+
+    const postIds = items.map((post) => post.id);
+    const previewMediaMap = new Map<string, string[]>();
+    if (postIds.length > 0) {
+      const imageBlocks = await this.postRepository.manager.find(PostBlock, {
+        where: {
+          postId: In(postIds),
+          type: PostBlockType.IMAGE,
+        },
+        order: {
+          layoutRow: 'ASC',
+          layoutCol: 'ASC',
+          layoutSpan: 'ASC',
+        },
+      });
+      imageBlocks.forEach((block) => {
+        const val = block.value as BlockValueMap[typeof PostBlockType.IMAGE];
+        const mediaIds = val.mediaIds ?? [];
+        const existing = previewMediaMap.get(block.postId) ?? [];
+        const merged = [...new Set([...existing, ...mediaIds])].slice(0, 5);
+        previewMediaMap.set(block.postId, merged);
+      });
+    }
+
+    const resultItems: SearchResultItemDto[] = await Promise.all(
+      items.map(async (post) => {
+        const previewMediaIds = previewMediaMap.get(post.id) ?? [];
+
+        // Snippet extraction (first text block)
+        const firstTextBlock = await this.postRepository.manager.findOne(
+          PostBlock,
+          {
+            where: { postId: post.id, type: PostBlockType.TEXT },
+            order: { layoutRow: 'ASC', layoutCol: 'ASC' },
+          },
+        );
+
+        // Location Info from PostBlock if available
+        const locationBlock = await this.postRepository.manager.findOne(
+          PostBlock,
+          {
+            where: { postId: post.id, type: PostBlockType.LOCATION },
+          },
+        );
+
+        return {
+          id: post.id,
+          previewMediaIds,
+          title: post.title,
+          eventAt: post.eventAt!,
+          location: locationBlock
+            ? {
+                address: (locationBlock.value as { address: string }).address,
+                placeName: (locationBlock.value as { placeName?: string })
+                  .placeName,
+              }
+            : undefined,
+          snippet: firstTextBlock
+            ? (firstTextBlock.value as { text: string }).text.substring(0, 100)
+            : undefined,
+        };
+      }),
+    );
+
+    let nextCursor: string | undefined;
+    if (hasNextPage) {
+      const lastItem = items[items.length - 1];
+      if (lastItem.eventAt) {
+        nextCursor = this.encodeCursor(lastItem.eventAt, lastItem.id, count);
+      }
+    }
+
+    return {
+      items: resultItems,
+      count,
+      nextCursor,
+    };
+  }
+
+  private applyCursor(
+    query: SelectQueryBuilder<Post>,
+    cursor: DecodedSearchCursor | null,
+  ) {
+    if (!cursor) return;
+
+    query.andWhere(
+      new Brackets((qb) => {
+        qb.where('post.eventAt < :eventAt', {
+          eventAt: cursor.eventAt,
+        }).orWhere('post.eventAt = :eventAt AND post.id < :id', {
+          eventAt: cursor.eventAt,
+          id: cursor.id,
+        });
+      }),
+    );
+  }
+
+  private decodeCursor(cursor?: string): DecodedSearchCursor | null {
+    if (!cursor) return null;
+
+    try {
+      const decoded = Buffer.from(cursor, 'base64').toString('utf-8');
+      const [eventAtStr, id, countStr] = decoded.split('|');
+      if (!eventAtStr || !id) return null;
+
+      const eventAt = new Date(eventAtStr);
+      if (Number.isNaN(eventAt.getTime())) return null;
+
+      const parsedCount = Number.parseInt(countStr ?? '', 10);
+      const count =
+        Number.isInteger(parsedCount) && parsedCount >= 0
+          ? parsedCount
+          : undefined;
+
+      return { eventAt, id, count };
+    } catch {
+      // TODO: Replace permissive fallback with explicit 400 (INVALID_CURSOR)
+      // when cursor is provided but cannot be decoded/parsed.
+      // TODO: Add cursor signature (e.g., HMAC) to prevent tampering.
+      return null;
+    }
+  }
+
+  private normalizeDateOnlyBoundary(value: string, boundary: 'start' | 'end') {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
+
+    const dateTime = DateTime.fromISO(value, { zone: 'Asia/Seoul' });
+    return (
+      (boundary === 'start'
+        ? dateTime.startOf('day')
+        : dateTime.endOf('day')
+      ).toISO() ?? value
+    );
+  }
+
+  private encodeCursor(eventAt: Date, id: string, count?: number): string {
+    const value =
+      count === undefined
+        ? `${eventAt.toISOString()}|${id}`
+        : `${eventAt.toISOString()}|${id}|${count}`;
+    return Buffer.from(value).toString('base64');
+  }
+
+  getRecentSearches(userId: string): string[] {
+    // TODO: Fetch from Redis
+    return this.recentSearches.get(userId) || [];
+  }
+
+  private saveRecentSearch(userId: string, keyword: string) {
+    const trimmedKeyword = keyword.trim();
+    if (!trimmedKeyword) return;
+
+    let keywords = this.recentSearches.get(userId) || [];
+
+    // Remove if already exists to move it to the top
+    keywords = keywords.filter((k) => k !== trimmedKeyword);
+
+    // Add to top
+    keywords.unshift(trimmedKeyword);
+
+    // Keep only top 10
+    if (keywords.length > 10) {
+      keywords = keywords.slice(0, 10);
+    }
+
+    // TODO: Save to Redis
+    this.recentSearches.set(userId, keywords);
+  }
+
+  getTopTags(userId: string, limit: number = 10): string[] {
+    // TODO: Fetch from Redis (ZREVRANGE)
+    const frequencies = this.tagFrequencies.get(userId);
+    if (!frequencies) return [];
+
+    return Array.from(frequencies.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, limit)
+      .map(([tag]) => tag);
+  }
+
+  private trackTags(userId: string, tags: string[]) {
+    // TODO: Use Redis INCRBY for each tag
+    let userFrequencies = this.tagFrequencies.get(userId);
+    if (!userFrequencies) {
+      userFrequencies = new Map<string, number>();
+      this.tagFrequencies.set(userId, userFrequencies);
+    }
+
+    for (const tag of tags) {
+      const trimmedTag = tag.trim();
+      if (!trimmedTag) continue;
+      const count = userFrequencies.get(trimmedTag) || 0;
+      userFrequencies.set(trimmedTag, count + 1);
+    }
+  }
+}
